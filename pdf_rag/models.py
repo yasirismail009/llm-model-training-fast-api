@@ -2,6 +2,18 @@ from django.db import models
 import uuid
 import os
 
+class Tag(models.Model):
+    """Model to store unique tags that can be associated with documents."""
+    name = models.CharField(max_length=100, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        ordering = ['name']
+
 class PDFDocument(models.Model):
     """Model to store information about uploaded PDF documents."""
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -9,6 +21,7 @@ class PDFDocument(models.Model):
     file = models.FileField(upload_to='pdf_uploads/')
     total_pages = models.IntegerField(default=0)
     total_chunks = models.IntegerField(default=0)
+    tags = models.ManyToManyField(Tag, related_name='documents', blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

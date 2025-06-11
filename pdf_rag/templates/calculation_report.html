@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document Analysis Report</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.1);
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 3px solid #007bff;
+        }
+        .header h1 {
+            color: #333;
+            margin: 0;
+            font-size: 2.5em;
+        }
+        .header p {
+            color: #666;
+            font-size: 1.2em;
+            margin: 10px 0 0 0;
+        }
+        .document-info {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+            border-left: 5px solid #28a745;
+        }
+        .document-info h2 {
+            margin-top: 0;
+            color: #28a745;
+        }
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+        .info-item {
+            background: white;
+            padding: 15px;
+            border-radius: 5px;
+            text-align: center;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .info-item .label {
+            font-weight: bold;
+            color: #666;
+            font-size: 0.9em;
+            text-transform: uppercase;
+        }
+        .info-item .value {
+            font-size: 1.5em;
+            color: #333;
+            margin-top: 5px;
+        }
+        .calculations-section {
+            margin: 30px 0;
+        }
+        .calculations-section h2 {
+            color: #007bff;
+            border-bottom: 2px solid #007bff;
+            padding-bottom: 10px;
+        }
+        .calculation-type {
+            margin: 20px 0;
+            background: #f8f9fa;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .calculation-type h3 {
+            background: #007bff;
+            color: white;
+            margin: 0;
+            padding: 15px 20px;
+            font-size: 1.2em;
+        }
+        .calculation-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 0;
+        }
+        .calculation-table th,
+        .calculation-table td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        .calculation-table th {
+            background: #f1f3f4;
+            font-weight: bold;
+            color: #333;
+        }
+        .calculation-table tr:hover {
+            background: #f8f9fa;
+        }
+        .result-value {
+            font-weight: bold;
+            color: #28a745;
+            font-family: 'Courier New', monospace;
+        }
+        .formula {
+            font-family: 'Courier New', monospace;
+            background: #f8f9fa;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.9em;
+        }
+        .visualization {
+            margin: 30px 0;
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .visualization h3 {
+            color: #333;
+            margin-top: 0;
+            text-align: center;
+        }
+        .summary-section {
+            background: #e3f2fd;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 30px 0;
+            border-left: 5px solid #2196f3;
+        }
+        .summary-section h2 {
+            color: #1976d2;
+            margin-top: 0;
+        }
+        .answer-section {
+            background: #fff3e0;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 30px 0;
+            border-left: 5px solid #ff9800;
+        }
+        .answer-section h2 {
+            color: #f57c00;
+            margin-top: 0;
+        }
+        .answer-text {
+            font-size: 1.1em;
+            line-height: 1.8;
+            color: #333;
+        }
+        .sources-section {
+            margin: 30px 0;
+        }
+        .source-item {
+            background: #f8f9fa;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            border-left: 4px solid #6c757d;
+        }
+        .source-item .source-header {
+            font-weight: bold;
+            color: #495057;
+            margin-bottom: 8px;
+        }
+        .source-item .source-snippet {
+            color: #666;
+            font-style: italic;
+        }
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            background: #007bff;
+            color: white;
+            border-radius: 12px;
+            font-size: 0.8em;
+            margin-left: 10px;
+        }
+        .badge.excel { background: #28a745; }
+        .badge.word { background: #17a2b8; }
+        .badge.pdf { background: #dc3545; }
+        @media (max-width: 768px) {
+            .container {
+                padding: 15px;
+            }
+            .info-grid {
+                grid-template-columns: 1fr;
+            }
+            .calculation-table {
+                font-size: 0.9em;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📊 Document Analysis Report</h1>
+            <p>Comprehensive analysis with calculation detection and insights</p>
+        </div>
+
+        {% if document %}
+        <div class="document-info">
+            <h2>📄 Document Information</h2>
+            <div class="info-grid">
+                <div class="info-item">
+                    <div class="label">Filename</div>
+                    <div class="value">{{ document.filename }}</div>
+                </div>
+                <div class="info-item">
+                    <div class="label">Type</div>
+                    <div class="value">
+                        {{ document.document_type|upper }}
+                        <span class="badge {{ document.document_type }}">{{ document.document_type }}</span>
+                    </div>
+                </div>
+                <div class="info-item">
+                    <div class="label">Total Chunks</div>
+                    <div class="value">{{ document.total_chunks }}</div>
+                </div>
+                {% if document.document_type == 'excel' %}
+                <div class="info-item">
+                    <div class="label">Total Sheets</div>
+                    <div class="value">{{ document.total_sheets }}</div>
+                </div>
+                {% else %}
+                <div class="info-item">
+                    <div class="label">Total Pages</div>
+                    <div class="value">{{ document.total_pages }}</div>
+                </div>
+                {% endif %}
+                <div class="info-item">
+                    <div class="label">Has Calculations</div>
+                    <div class="value">
+                        {% if document.has_calculations %}
+                            ✅ Yes
+                        {% else %}
+                            ❌ No
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
+        {% if answer %}
+        <div class="answer-section">
+            <h2>💡 AI Analysis</h2>
+            <div class="answer-text">{{ answer|linebreaks }}</div>
+        </div>
+        {% endif %}
+
+        {% if calculations %}
+        <div class="calculations-section">
+            <h2>🧮 Detected Calculations</h2>
+            
+            {% for calc_type, calcs in calculations_by_type.items %}
+            <div class="calculation-type">
+                <h3>{{ calc_type|title }} Calculations ({{ calcs|length }})</h3>
+                <table class="calculation-table">
+                    <thead>
+                        <tr>
+                            <th>Description</th>
+                            <th>Result</th>
+                            <th>Formula</th>
+                            <th>Source</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for calc in calcs %}
+                        <tr>
+                            <td>{{ calc.description }}</td>
+                            <td class="result-value">
+                                {% if calc.result_value %}
+                                    {{ calc.result_value|floatformat:2 }}
+                                {% else %}
+                                    {{ calc.result_text|default:"N/A" }}
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if calc.formula %}
+                                    <span class="formula">{{ calc.formula|truncatechars:50 }}</span>
+                                {% else %}
+                                    -
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if calc.source_data.sheet %}
+                                    Sheet: {{ calc.source_data.sheet }}
+                                    {% if calc.source_data.cell %}
+                                        ({{ calc.source_data.cell }})
+                                    {% endif %}
+                                {% elif calc.source_data.column %}
+                                    Column: {{ calc.source_data.column }}
+                                {% else %}
+                                    Document
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        {% if visualizations %}
+        <div class="visualization">
+            <h3>📈 Calculation Visualizations</h3>
+            {% if visualizations.summary %}
+            <div id="summary-chart"></div>
+            <script>
+                var summaryData = {{ visualizations.summary|safe }};
+                Plotly.newPlot('summary-chart', summaryData.data, summaryData.layout);
+            </script>
+            {% endif %}
+            
+            {% if visualizations.results %}
+            <div id="results-chart" style="margin-top: 30px;"></div>
+            <script>
+                var resultsData = {{ visualizations.results|safe }};
+                Plotly.newPlot('results-chart', resultsData.data, resultsData.layout);
+            </script>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        {% if sources %}
+        <div class="sources-section">
+            <h2>📚 Sources</h2>
+            {% for source in sources %}
+            <div class="source-item">
+                <div class="source-header">
+                    {{ source.source }}
+                    <span class="badge {{ source.document_type }}">{{ source.document_type|upper }}</span>
+                    {% if source.document_type == 'excel' %}
+                        - Sheet: {{ source.sheet_name|default:"Unknown" }}
+                    {% else %}
+                        - Page: {{ source.page|default:"Unknown" }}
+                    {% endif %}
+                </div>
+                <div class="source-snippet">{{ source.snippet }}</div>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        {% if summary %}
+        <div class="summary-section">
+            <h2>📋 Document Summary</h2>
+            <p><strong>Document Type:</strong> {{ summary.document_type|upper }}</p>
+            <p><strong>Total Chunks:</strong> {{ summary.total_chunks }}</p>
+            <p><strong>Has Calculations:</strong> 
+                {% if summary.has_calculations %}✅ Yes{% else %}❌ No{% endif %}
+            </p>
+            <p><strong>Preview:</strong></p>
+            <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; margin-top: 10px;">
+                {{ summary.preview|linebreaks }}
+            </div>
+        </div>
+        {% endif %}
+
+        <div style="text-align: center; margin-top: 40px; padding-top: 20px; border-top: 1px solid #ddd; color: #666;">
+            <p>Generated by Enhanced Document RAG System</p>
+            <p>📊 Advanced document analysis with calculation detection</p>
+        </div>
+    </div>
+</body>
+</html> 

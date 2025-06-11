@@ -3,6 +3,7 @@ from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+import json
 from rest_framework.permissions import AllowAny
 from django.conf import settings
 import os
@@ -10,10 +11,10 @@ import PyPDF2
 import pinecone
 import uuid
 import shutil
-from .models import PDFDocument, DocumentChunk
+from .models import PDFDocument, DocumentChunk, Tag
 from .serializers import (
     PDFDocumentSerializer, DocumentUploadSerializer,
-    QuerySerializer, ContextRetrievalSerializer
+    QuerySerializer, ContextRetrievalSerializer, TagSerializer
 )
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -76,16 +77,16 @@ llm = HuggingFaceEndpoint(
 
 chat = ChatHuggingFace(llm=llm, verbose=True)
 
-# Create custom prompt template
-template = """You are a helpful AI assistant that answers questions based on the provided context from PDF documents.
+# Create custom prompt template with stronger directives
+template =  """You are a helpful AI assistant that answers questions based on the provided context from PDF documents.
 Your task is to:
 1. Analyze all the provided context carefully
 2. Combine information from different sources if relevant
 3. Look for document page numbers in the context (format: [Page X of Y]) and use those in your answer
 4. Provide a comprehensive and accurate answer
-5. If the answer is not in the context, say "I don't have enough information to answer this question based on the documents provided"
-6. NEVER make up information or include any information not found in the provided context
-7. When providing your answer, cite specific page numbers where information was found
+5. Do compilation if there is comparison or compilation in the question
+6. Do comparison if there is comparison in the question
+7. Do highlights if there is highlights in the question
 
 Context:
 {context}
@@ -93,7 +94,6 @@ Context:
 Question: {question}
 
 Answer:"""
-
 QA_CHAIN_PROMPT = PromptTemplate(
     input_variables=["context", "question"],
     template=template,
@@ -228,12 +228,29 @@ class PDFUploadView(APIView):
         serializer = DocumentUploadSerializer(data=request.data)
         if serializer.is_valid():
             pdf_file = serializer.validated_data['file']
+            tags = serializer.validated_data.get('tags', [])
             
-            # Create PDFDocument instance
+            # Create PDFDocument instance without tags
             document = PDFDocument.objects.create(
                 filename=pdf_file.name,
                 file=pdf_file
             )
+            
+            # Add tags after creation
+            if tags:
+                # Handle the case where tags is a list containing a JSON string
+                if isinstance(tags, list) and len(tags) > 0 and isinstance(tags[0], str):
+                    try:
+                        # Parse the JSON string to get the actual tag names
+                        tag_names = json.loads(tags[0])
+                        for tag_name in tag_names:
+                            tag, _ = Tag.objects.get_or_create(name=tag_name)
+                            document.tags.add(tag)
+                    except json.JSONDecodeError:
+                        # If not JSON, treat each item as a tag name
+                        for tag_name in tags:
+                            tag, _ = Tag.objects.get_or_create(name=tag_name)
+                            document.tags.add(tag)
             
             try:
                 # Process PDF
@@ -253,7 +270,7 @@ class PDFUploadView(APIView):
                         vector_id=vector_id
                     )
                     
-                    # Add to vectorstore
+                    # Add to vectorstore with tags
                     vectorstore.add_texts(
                         texts=[chunk_data["text"]],
                         metadatas=[{
@@ -261,7 +278,8 @@ class PDFUploadView(APIView):
                             "chunk_id": i,
                             "page": chunk_data["page_num"],
                             "total_pages": chunk_data["total_pages"],
-                            "chunk_on_page": chunk_data["chunk_on_page"]
+                            "chunk_on_page": chunk_data["chunk_on_page"],
+                            "tags": tags
                         }],
                         ids=[vector_id]
                     )
@@ -366,6 +384,13 @@ class ReindexDocumentsView(APIView):
             for filename in pdf_files:
                 file_path = os.path.join(settings.PDF_UPLOAD_DIR, filename)
                 
+                # Get document from database to preserve tags
+                try:
+                    document = PDFDocument.objects.get(filename=filename)
+                    tags = document.tags
+                except PDFDocument.DoesNotExist:
+                    tags = []
+                
                 # Process the PDF
                 chunks_with_metadata = process_pdf(file_path)
                 
@@ -387,7 +412,8 @@ class ReindexDocumentsView(APIView):
                         "chunk_id": i,
                         "page": chunk_data["page_num"],
                         "total_pages": chunk_data["total_pages"],
-                        "chunk_on_page": chunk_data["chunk_on_page"]
+                        "chunk_on_page": chunk_data["chunk_on_page"],
+                        "tags": tags
                     })
                     ids.append(f"{filename}_p{chunk_data['page_num']}_{i}_{str(uuid.uuid4())}")
                 
@@ -403,7 +429,8 @@ class ReindexDocumentsView(APIView):
                         processed_files.append({
                             "filename": filename,
                             "chunks": len(texts),
-                            "pages": chunks_with_metadata[-1]["total_pages"] if chunks_with_metadata else 0
+                            "pages": chunks_with_metadata[-1]["total_pages"] if chunks_with_metadata else 0,
+                            "tags": tags
                         })
                         total_chunks += len(texts)
                     except Exception as e:
@@ -430,13 +457,21 @@ class RetrieveContextView(APIView):
         if serializer.is_valid():
             question = serializer.validated_data['question']
             document_source = serializer.validated_data.get('document_source')
+            tags = serializer.validated_data.get('tags', [])
             k = serializer.validated_data['k']
             
             try:
                 search_kwargs = {"k": k}
+                filter_conditions = {}
                 
                 if document_source:
-                    search_kwargs["filter"] = {"source": {"$eq": document_source}}
+                    filter_conditions["source"] = {"$eq": document_source}
+                
+                if tags:
+                    filter_conditions["tags"] = {"$in": tags}
+                
+                if filter_conditions:
+                    search_kwargs["filter"] = filter_conditions
                 
                 docs = vectorstore.similarity_search(
                     question,
@@ -456,7 +491,8 @@ class RetrieveContextView(APIView):
                         "source": doc.metadata.get("source", "Unknown"),
                         "page": doc.metadata.get("page", "Unknown"),
                         "total_pages": doc.metadata.get("total_pages", "Unknown"),
-                        "chunk_id": doc.metadata.get("chunk_id", "Unknown")
+                        "chunk_id": doc.metadata.get("chunk_id", "Unknown"),
+                        "tags": doc.metadata.get("tags", [])
                     })
                 
                 return Response({
@@ -479,13 +515,56 @@ class AskQuestionView(APIView):
         serializer = QuerySerializer(data=request.data)
         if serializer.is_valid():
             question = serializer.validated_data['question']
-            k = 7
-            include_sources = True
+            tags = serializer.validated_data.get('tags', [])
             
             try:
+                # Create retriever with tag filtering
+                search_kwargs = {"k": 10}  # Increased for better context
+                if tags:
+                    # Handle the case where tags is a list containing a JSON string
+                    if isinstance(tags, list) and len(tags) > 0 and isinstance(tags[0], str):
+                        try:
+                            # Parse the JSON string to get the actual tag names
+                            tag_names = json.loads(tags[0])
+                            print(f"Parsed tag names: {tag_names}")
+                            search_kwargs["filter"] = {"tags": {"$in": tag_names}}
+                        except json.JSONDecodeError:
+                            # If not JSON, use the tags as they are
+                            print(f"Using raw tags: {tags}")
+                            search_kwargs["filter"] = {"tags": {"$in": tags}}
+                
+                print(f"Search kwargs: {search_kwargs}")
+                
+                # Try similarity search with better error handling
+                similar_docs = vectorstore.similarity_search(
+                    question,
+                    **search_kwargs
+                )
+                print(f"Found {len(similar_docs)} similar documents")
+                
+                if not similar_docs:
+                    # If no documents found, try without tag filtering
+                    print("No documents found with tags, trying without filters")
+                    similar_docs = vectorstore.similarity_search(
+                        question,
+                        k=10  # Use same increased value
+                    )
+                    print(f"Found {len(similar_docs)} documents without filters")
+                    
+                    if similar_docs:
+                        # Use these documents without filtering
+                        search_kwargs = {"k": 10}
+                
+                # Return error if still no documents found
+                if not similar_docs:
+                    return Response(
+                        {"error": "No relevant documents found for your query."},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+                
                 # Create retriever
                 retriever = vectorstore.as_retriever(
-                    search_kwargs={"k": k}
+                    search_kwargs=search_kwargs
                 )
                 
                 # Create QA chain
@@ -503,30 +582,57 @@ class AskQuestionView(APIView):
                 # Get answer
                 result = qa_chain({"query": question})
                 
+                # Clean up the response better
+                answer = result["result"]
+                if isinstance(answer, str):
+                    answer = answer.strip()
+                    # Remove quotes and clean formatting
+                    if answer.startswith("'") and answer.endswith("'"):
+                        answer = answer[1:-1]
+                    if answer.startswith('"') and answer.endswith('"'):
+                        answer = answer[1:-1]
+                
                 response = {
-                    "answer": result["result"]
+                    "answer": answer
                 }
                 
-                if include_sources:
-                    sources = []
-                    for doc in result["source_documents"]:
+                # Process sources with better deduplication
+                sources = []
+                seen_sources = set()  # To track unique source/page combinations
+                
+                for doc in result["source_documents"]:
+                    source = doc.metadata.get("source", "Unknown")
+                    page = doc.metadata.get("page", "Unknown")
+                    total_pages = doc.metadata.get("total_pages", "Unknown")
+                    
+                    # Create unique key for deduplication
+                    source_key = f"{source}_{page}"
+                    
+                    if source_key not in seen_sources:
+                        seen_sources.add(source_key)
+                        
+                        # Better snippet handling
+                        content = doc.page_content.strip()
+                        snippet = content[:300] + "..." if len(content) > 300 else content
+                        
                         sources.append({
-                            "source": doc.metadata.get("source", "Unknown"),
-                            "chunk_id": doc.metadata.get("chunk_id", "Unknown"),
-                            "page": doc.metadata.get("page", "Unknown"),
-                            "total_pages": doc.metadata.get("total_pages", "Unknown"),
-                            "snippet": doc.page_content[:250] + "..." if len(doc.page_content) > 250 else doc.page_content
+                            "source": source,
+                            "page": float(page) if isinstance(page, (int, float, str)) and str(page).replace('.', '').isdigit() else page,
+                            "total_pages": float(total_pages) if isinstance(total_pages, (int, float, str)) and str(total_pages).replace('.', '').isdigit() else total_pages,
+                            "snippet": snippet
                         })
-                    response["sources"] = sources
+                
+                response["sources"] = sources
                 
                 return Response(response)
+                
             except Exception as e:
+                print(f"Error in AskQuestionView: {str(e)}")
                 return Response(
-                    {"error": str(e)},
+                    {"error": f"Processing failed: {str(e)}"},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
 class DeleteDocumentView(APIView):
     permission_classes = [AllowAny]
 
@@ -591,3 +697,128 @@ class ClearAllDocumentsView(APIView):
                 {"error": str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+class DocumentTagsView(APIView):
+    permission_classes = [AllowAny]
+    parser_classes = [JSONParser]
+
+    def patch(self, request, document_id):
+        """Update tags for a specific document."""
+        try:
+            document = PDFDocument.objects.get(id=document_id)
+            
+            # Validate tags
+            if 'tags' not in request.data:
+                return Response(
+                    {"error": "Tags field is required"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            tags = request.data['tags']
+            if not isinstance(tags, list):
+                return Response(
+                    {"error": "Tags must be a list"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Update document tags
+            document.tags = tags
+            document.save()
+            
+            # Update tags in vectorstore
+            pinecone_index = pc.Index(INDEX_NAME)
+            
+            # Find all vectors for this document
+            query_response = pinecone_index.query(
+                vector=[0] * 384,  # Dummy vector for metadata-only query
+                top_k=10000,
+                include_metadata=True,
+                filter={"source": {"$eq": document.filename}},
+                namespace=NAMESPACE
+            )
+            
+            # Update metadata for each vector
+            for match in query_response.matches:
+                metadata = match.metadata
+                metadata['tags'] = tags
+                
+                # Update vector metadata
+                pinecone_index.update(
+                    id=match.id,
+                    metadata=metadata,
+                    namespace=NAMESPACE
+                )
+            
+            return Response({
+                "message": f"Successfully updated tags for document {document.filename}",
+                "document_id": str(document.id),
+                "tags": tags
+            })
+            
+        except PDFDocument.DoesNotExist:
+            return Response(
+                {"error": "Document not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+class TagListView(APIView):
+    """View to list all tags and create new ones."""
+    permission_classes = [AllowAny]
+    parser_classes = [JSONParser]
+    
+    def get(self, request):
+        """List all tags."""
+        tags = Tag.objects.all()
+        serializer = TagSerializer(tags, many=True)
+        return Response(serializer.data)
+    
+    def post(self, request):
+        """Create a new tag."""
+        serializer = TagSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class TagDetailView(APIView):
+    """View to retrieve, update or delete a tag."""
+    permission_classes = [AllowAny]
+    parser_classes = [JSONParser]
+    
+    def get_object(self, pk):
+        try:
+            return Tag.objects.get(pk=pk)
+        except Tag.DoesNotExist:
+            return None
+    
+    def get(self, request, pk):
+        """Retrieve a tag."""
+        tag = self.get_object(pk)
+        if not tag:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = TagSerializer(tag)
+        return Response(serializer.data)
+    
+    def put(self, request, pk):
+        """Update a tag."""
+        tag = self.get_object(pk)
+        if not tag:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = TagSerializer(tag, data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    def delete(self, request, pk):
+        """Delete a tag."""
+        tag = self.get_object(pk)
+        if not tag:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        tag.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
