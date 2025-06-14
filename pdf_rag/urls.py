@@ -12,6 +12,8 @@ from .views import (
     TagDetailView
 )
 
+app_name = 'pdf_rag'
+
 urlpatterns = [
     # Document Management
     path('upload-pdf/', PDFUploadView.as_view(), name='upload-pdf'),

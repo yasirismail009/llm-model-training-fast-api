@@ -21,5 +21,5 @@ from django.conf.urls.static import static
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('', include('pdf_rag.urls')),  # Include PDF RAG app URLs
+    path('api/', include('pdf_rag.urls', namespace='pdf_rag')),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)  # Serve media files in development

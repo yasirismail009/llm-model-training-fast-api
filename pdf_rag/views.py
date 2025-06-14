@@ -8,7 +8,7 @@ from rest_framework.permissions import AllowAny
 from django.conf import settings
 import os
 import PyPDF2
-import pinecone
+from pinecone import Pinecone, ServerlessSpec
 import uuid
 import shutil
 from .models import PDFDocument, DocumentChunk, Tag
@@ -24,6 +24,11 @@ from langchain_core.prompts import PromptTemplate
 from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 from dotenv import load_dotenv
 from .utils import process_pdf, text_splitter
+from .analytics import DocumentAnalytics
+import logging
+import time
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -32,23 +37,27 @@ INDEX_NAME = "methodology-index"
 NAMESPACE = "myspace"
 
 # Initialize Pinecone client
-pc = pinecone.Pinecone(
-    api_key=os.getenv("PINECONE_API_KEY"),
-    environment=os.getenv("PINECONE_ENVIRONMENT")
+pc = Pinecone(
+    api_key=os.getenv("PINECONE_API_KEY")
 )
 
 # Get or create index
 try:
     # Check if index exists
-    if INDEX_NAME not in pc.list_indexes():
+    if INDEX_NAME not in pc.list_indexes().names():
         # Create index if it doesn't exist
         pc.create_index(
             name=INDEX_NAME,
             dimension=384,  # Dimension for all-MiniLM-L6-v2
-            metric="cosine"
+            metric="cosine",
+            spec=ServerlessSpec(
+                cloud='aws',
+                region='us-west-2'
+            )
         )
 except Exception as e:
-    print(f"Error initializing Pinecone index: {str(e)}")
+    logger.error(f"Error initializing Pinecone index: {str(e)}")
+    raise
 
 # Initialize embeddings
 embeddings = HuggingFaceEmbeddings(
@@ -58,7 +67,7 @@ embeddings = HuggingFaceEmbeddings(
 )
 
 # Initialize vectorstore
-vectorstore = PineconeVectorStore(
+vectorstore = PineconeVectorStore.from_existing_index(
     index_name=INDEX_NAME,
     embedding=embeddings,
     text_key="text",
@@ -77,16 +86,19 @@ llm = HuggingFaceEndpoint(
 
 chat = ChatHuggingFace(llm=llm, verbose=True)
 
-# Create custom prompt template with stronger directives
-template =  """You are a helpful AI assistant that answers questions based on the provided context from PDF documents.
+# Create enhanced prompt template with analytics capabilities
+template = """You are a helpful AI assistant that answers questions based on the provided context from PDF documents.
 Your task is to:
 1. Analyze all the provided context carefully
 2. Combine information from different sources if relevant
 3. Look for document page numbers in the context (format: [Page X of Y]) and use those in your answer
 4. Provide a comprehensive and accurate answer
 5. Do compilation if there is comparison or compilation in the question
-6. Do comparison if there is comparison in the question
-7. Do highlights if there is highlights in the question
+6. Do highlights if there is highlights in the question
+7. Provide a brief summary of the key points
+8. Classify the type of information being discussed
+9. If tables are present in the context, analyze and explain their significance
+10. Maintain the original document structure and formatting where relevant
 
 Context:
 {context}
@@ -94,10 +106,14 @@ Context:
 Question: {question}
 
 Answer:"""
+
 QA_CHAIN_PROMPT = PromptTemplate(
     input_variables=["context", "question"],
     template=template,
 )
+
+# Initialize analytics
+document_analytics = DocumentAnalytics()
 
 def process_pdf_chunk(args):
     """Process a chunk of PDF pages."""
@@ -270,7 +286,16 @@ class PDFUploadView(APIView):
                         vector_id=vector_id
                     )
                     
-                    # Add to vectorstore with tags
+                    # Add to vectorstore with tags in a simpler format
+                    formatted_tags = []
+                    if tags:
+                        if isinstance(tags, list) and len(tags) > 0 and isinstance(tags[0], str):
+                            try:
+                                tag_names = json.loads(tags[0])
+                                formatted_tags = tag_names
+                            except json.JSONDecodeError:
+                                formatted_tags = tags
+                    
                     vectorstore.add_texts(
                         texts=[chunk_data["text"]],
                         metadatas=[{
@@ -279,7 +304,7 @@ class PDFUploadView(APIView):
                             "page": chunk_data["page_num"],
                             "total_pages": chunk_data["total_pages"],
                             "chunk_on_page": chunk_data["chunk_on_page"],
-                            "tags": tags
+                            "tags": formatted_tags
                         }],
                         ids=[vector_id]
                     )
@@ -317,10 +342,10 @@ class DocumentListView(APIView):
         """List all documents in the vector database with their metadata."""
         try:
             # Get all documents from Pinecone
-            pinecone_index = pc.Index(INDEX_NAME)
+            index = pc.Index(INDEX_NAME)
             
             # Use query instead of fetch for Pinecone v2
-            query_response = pinecone_index.query(
+            query_response = index.query(
                 vector=[0] * 384,  # Dummy vector for metadata-only query
                 top_k=10000,
                 include_metadata=True,
@@ -369,10 +394,10 @@ class ReindexDocumentsView(APIView):
                 })
                 
             # Clear existing index
-            pinecone_index = pc.Index(INDEX_NAME)
+            index = pc.Index(INDEX_NAME)
             try:
                 # Try to delete the namespace
-                pinecone_index.delete(delete_all=True, namespace=NAMESPACE)
+                index.delete(delete_all=True, namespace=NAMESPACE)
             except Exception as e:
                 # If namespace doesn't exist, that's fine - we'll create it when adding vectors
                 print(f"Namespace deletion error (can be ignored): {str(e)}")
@@ -417,30 +442,22 @@ class ReindexDocumentsView(APIView):
                     })
                     ids.append(f"{filename}_p{chunk_data['page_num']}_{i}_{str(uuid.uuid4())}")
                 
+                # Add chunks to vectorstore
                 if texts:
-                    try:
-                        # Add chunks to vectorstore
-                        vectorstore.add_texts(
-                            texts=texts,
-                            metadatas=metadatas,
-                            ids=ids
-                        )
-                        
-                        processed_files.append({
-                            "filename": filename,
-                            "chunks": len(texts),
-                            "pages": chunks_with_metadata[-1]["total_pages"] if chunks_with_metadata else 0,
-                            "tags": tags
-                        })
-                        total_chunks += len(texts)
-                    except Exception as e:
-                        print(f"Error processing file {filename}: {str(e)}")
-                        continue
+                    vectorstore.add_texts(
+                        texts=texts,
+                        metadatas=metadatas,
+                        ids=ids
+                    )
+                    total_chunks += len(texts)
+                    processed_files.append(filename)
             
             return Response({
-                "message": f"Successfully reindexed {len(processed_files)} documents with {total_chunks} total chunks",
-                "processed_files": processed_files
+                "message": "Documents reindexed successfully",
+                "processed_files": processed_files,
+                "total_chunks": total_chunks
             })
+            
         except Exception as e:
             return Response(
                 {"error": str(e)},
@@ -506,133 +523,193 @@ class RetrieveContextView(APIView):
                 )
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+def generate_answer(question, context):
+    """Generate an answer using the provided context."""
+    try:
+        # Prompt that requests HTML formatting
+        prompt = f"""Analyze these financial statements and answer the question using HTML formatting.
+        Use tables for comparisons and bullet points for key points.
+        
+        Financial Statements:
+        {context}
+        
+        Question: {question}
+        
+        Please format your response using HTML:
+        - Use <table> for financial comparisons
+        - Use <ul> and <li> for bullet points
+        - Use <h3> for section headers
+        - Use <p> for paragraphs
+        - Use <strong> for emphasis
+        
+        Answer:"""
+        
+        # Get response from the LLM with proper model configuration
+        response = chat.invoke(
+            input=prompt,
+            config={
+                "model": "microsoft/phi-2",  # Using a faster model
+                "temperature": 0.3,  # Lower temperature for faster, more focused responses
+                "max_tokens": 800,  # Reduced token limit for faster responses
+                "max_new_tokens": 800,  # Reduced new tokens for faster responses
+                "top_p": 0.9,  # Added for better response quality
+                "repetition_penalty": 1.1  # Added to reduce repetition
+            }
+        )
+        
+        # Extract the actual content from the response
+        if hasattr(response, 'content'):
+            answer = response.content
+        else:
+            answer = str(response)
+            
+        # Ensure proper HTML formatting
+        if not answer.strip().startswith('<'):
+            # If response doesn't start with HTML, wrap it in a div
+            answer = f'<div class="analysis-response">{answer}</div>'
+            
+        # Add some basic styling
+        styled_answer = f"""
+        <style>
+            .analysis-response table {{
+                border-collapse: collapse;
+                width: 100%;
+                margin: 15px 0;
+            }}
+            .analysis-response th, .analysis-response td {{
+                border: 1px solid #ddd;
+                padding: 8px;
+                text-align: left;
+            }}
+            .analysis-response th {{
+                background-color: #f5f5f5;
+            }}
+            .analysis-response ul {{
+                margin: 10px 0;
+                padding-left: 20px;
+            }}
+            .analysis-response li {{
+                margin: 5px 0;
+            }}
+            .analysis-response h3 {{
+                color: #333;
+                margin: 15px 0 10px 0;
+            }}
+            .analysis-response p {{
+                margin: 10px 0;
+                line-height: 1.5;
+            }}
+            .analysis-response strong {{
+                color: #0066cc;
+            }}
+        </style>
+        {answer}
+        """
+        
+        return styled_answer
+        
+    except Exception as e:
+        logger.error(f"Error generating answer: {str(e)}")
+        return "I apologize, but I encountered an error while generating the answer. Please try again."
+
 class AskQuestionView(APIView):
     parser_classes = [JSONParser]
     permission_classes = [AllowAny]
 
     def post(self, request):
-        """Get an LLM-generated answer based on relevant document context."""
+        """Ask a question about the documents."""
         serializer = QuerySerializer(data=request.data)
         if serializer.is_valid():
             question = serializer.validated_data['question']
             tags = serializer.validated_data.get('tags', [])
             
             try:
-                # Create retriever with tag filtering
-                search_kwargs = {"k": 10}  # Increased for better context
+                # Get all relevant documents
+                search_kwargs = {"k": 10000}  # Get all documents
+                print("Initial search_kwargs:", search_kwargs)
+
+                # Handle tags if provided
                 if tags:
-                    # Handle the case where tags is a list containing a JSON string
-                    if isinstance(tags, list) and len(tags) > 0 and isinstance(tags[0], str):
+                    if isinstance(tags, str):
                         try:
-                            # Parse the JSON string to get the actual tag names
-                            tag_names = json.loads(tags[0])
-                            print(f"Parsed tag names: {tag_names}")
-                            search_kwargs["filter"] = {"tags": {"$in": tag_names}}
+                            tags = json.loads(tags)
                         except json.JSONDecodeError:
-                            # If not JSON, use the tags as they are
-                            print(f"Using raw tags: {tags}")
-                            search_kwargs["filter"] = {"tags": {"$in": tags}}
+                            tags = [tags]
+                    elif not isinstance(tags, list):
+                        tags = [str(tags)]
+                    
+                    tags = [tag.strip() for tag in tags if tag and isinstance(tag, str)]
+                    print("Cleaned tags:", tags)
+                    
+                    if tags:
+                        search_kwargs["filter"] = {
+                            "tags": {"$in": tags}
+                        }
+                print("Final search_kwargs:", search_kwargs)
                 
-                print(f"Search kwargs: {search_kwargs}")
-                
-                # Try similarity search with better error handling
+                # Get all similar documents
                 similar_docs = vectorstore.similarity_search(
                     question,
                     **search_kwargs
                 )
-                print(f"Found {len(similar_docs)} similar documents")
+                print("Number of similar docs found:", len(similar_docs))
                 
                 if not similar_docs:
-                    # If no documents found, try without tag filtering
-                    print("No documents found with tags, trying without filters")
-                    similar_docs = vectorstore.similarity_search(
-                        question,
-                        k=10  # Use same increased value
-                    )
-                    print(f"Found {len(similar_docs)} documents without filters")
+                    return Response({
+                        "error": "No relevant documents found for your query."
+                    })
+
+                # Process chunks in larger batches for efficiency
+                batch_size = 5  # Increased batch size
+                all_analyses = []
+                
+                for i in range(0, len(similar_docs), batch_size):
+                    batch_docs = similar_docs[i:i + batch_size]
                     
-                    if similar_docs:
-                        # Use these documents without filtering
-                        search_kwargs = {"k": 10}
-                
-                # Return error if still no documents found
-                if not similar_docs:
-                    return Response(
-                        {"error": "No relevant documents found for your query."},
-                        status=status.HTTP_404_NOT_FOUND
+                    # Prepare context for this batch
+                    context_parts = []
+                    for j, doc in enumerate(batch_docs, i + 1):
+                        chunk_info = f"\n--- Chunk {j} ---\n"
+                        chunk_info += f"Source: {doc.metadata.get('source', 'Unknown')}\n"
+                        chunk_info += f"Page: {doc.metadata.get('page', 'Unknown')}\n"
+                        chunk_info += f"Tags: {doc.metadata.get('tags', [])}\n"
+                        chunk_info += f"Content:\n{doc.page_content}\n"
+                        context_parts.append(chunk_info)
+                    
+                    batch_context = "\n".join(context_parts)
+                    
+                    # Generate analysis for this batch
+                    batch_analysis = generate_answer(
+                        f"Analyze these specific chunks from the financial statements: {question}",
+                        batch_context
                     )
+                    all_analyses.append(batch_analysis)
                 
-                # Create retriever
-                retriever = vectorstore.as_retriever(
-                    search_kwargs=search_kwargs
+                # Combine all analyses
+                combined_analysis = "\n\n=== Analysis Summary ===\n\n"
+                for i, analysis in enumerate(all_analyses, 1):
+                    combined_analysis += f"\n--- Batch {i} Analysis ---\n{analysis}\n"
+                
+                # Get final summary
+                final_summary = generate_answer(
+                    "Based on all the analyses above, provide a comprehensive summary of the financial differences between 2022 and 2023.",
+                    combined_analysis
                 )
                 
-                # Create QA chain
-                qa_chain = RetrievalQA.from_chain_type(
-                    llm=chat,
-                    chain_type="stuff",
-                    retriever=retriever,
-                    return_source_documents=True,
-                    chain_type_kwargs={
-                        "prompt": QA_CHAIN_PROMPT,
-                        "verbose": True
-                    }
-                )
-                
-                # Get answer
-                result = qa_chain({"query": question})
-                
-                # Clean up the response better
-                answer = result["result"]
-                if isinstance(answer, str):
-                    answer = answer.strip()
-                    # Remove quotes and clean formatting
-                    if answer.startswith("'") and answer.endswith("'"):
-                        answer = answer[1:-1]
-                    if answer.startswith('"') and answer.endswith('"'):
-                        answer = answer[1:-1]
-                
-                response = {
-                    "answer": answer
-                }
-                
-                # Process sources with better deduplication
-                sources = []
-                seen_sources = set()  # To track unique source/page combinations
-                
-                for doc in result["source_documents"]:
-                    source = doc.metadata.get("source", "Unknown")
-                    page = doc.metadata.get("page", "Unknown")
-                    total_pages = doc.metadata.get("total_pages", "Unknown")
-                    
-                    # Create unique key for deduplication
-                    source_key = f"{source}_{page}"
-                    
-                    if source_key not in seen_sources:
-                        seen_sources.add(source_key)
-                        
-                        # Better snippet handling
-                        content = doc.page_content.strip()
-                        snippet = content[:300] + "..." if len(content) > 300 else content
-                        
-                        sources.append({
-                            "source": source,
-                            "page": float(page) if isinstance(page, (int, float, str)) and str(page).replace('.', '').isdigit() else page,
-                            "total_pages": float(total_pages) if isinstance(total_pages, (int, float, str)) and str(total_pages).replace('.', '').isdigit() else total_pages,
-                            "snippet": snippet
-                        })
-                
-                response["sources"] = sources
-                
-                return Response(response)
+                return Response({
+                    "answer": final_summary,
+                    "detailed_analysis": combined_analysis,
+                    "sources": [doc.metadata for doc in similar_docs]
+                })
                 
             except Exception as e:
-                print(f"Error in AskQuestionView: {str(e)}")
+                logger.error(f"Error in AskQuestionView: {str(e)}")
                 return Response(
                     {"error": f"Processing failed: {str(e)}"},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
 class DeleteDocumentView(APIView):
     permission_classes = [AllowAny]
 
@@ -642,10 +719,10 @@ class DeleteDocumentView(APIView):
             document = PDFDocument.objects.get(id=document_id)
             
             # Delete from Pinecone
-            pinecone_index = pc.Index(INDEX_NAME)
+            index = pc.Index(INDEX_NAME)
             
             # First, find all vectors with this source in metadata
-            query_response = pinecone_index.query(
+            query_response = index.query(
                 vector=[0] * 384,  # Dummy vector for metadata-only query
                 top_k=10000,
                 include_metadata=True,
@@ -658,7 +735,7 @@ class DeleteDocumentView(APIView):
             
             if ids_to_delete:
                 # Delete the vectors
-                pinecone_index.delete(ids=ids_to_delete, namespace="myspace")
+                index.delete(ids=ids_to_delete, namespace="myspace")
             
             # Delete the document (this will also delete associated chunks)
             document.delete()
@@ -685,14 +762,15 @@ class ClearAllDocumentsView(APIView):
         """Delete all documents from the vector database and file system."""
         try:
             # Delete all vectors from Pinecone
-            pinecone_index = pc.Index(INDEX_NAME)
-            pinecone_index.delete(delete_all=True, namespace="myspace")
+            index = pc.Index(INDEX_NAME)
+            index.delete(delete_all=True, namespace="myspace")
             
             # Delete all documents and their chunks
             PDFDocument.objects.all().delete()
             
             return Response({"message": "All documents deleted successfully"})
         except Exception as e:
+            logger.error(f"Error in ClearAllDocumentsView: {str(e)}")
             return Response(
                 {"error": str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -726,10 +804,10 @@ class DocumentTagsView(APIView):
             document.save()
             
             # Update tags in vectorstore
-            pinecone_index = pc.Index(INDEX_NAME)
+            index = pc.Index(INDEX_NAME)
             
             # Find all vectors for this document
-            query_response = pinecone_index.query(
+            query_response = index.query(
                 vector=[0] * 384,  # Dummy vector for metadata-only query
                 top_k=10000,
                 include_metadata=True,
@@ -743,7 +821,7 @@ class DocumentTagsView(APIView):
                 metadata['tags'] = tags
                 
                 # Update vector metadata
-                pinecone_index.update(
+                index.update(
                     id=match.id,
                     metadata=metadata,
                     namespace=NAMESPACE
